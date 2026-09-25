@@ -2,7 +2,7 @@
 // 検索クエリ実績レポート（Google広告）
 // バージョン: v1.1（前月／当月の2タブ出力）
 // 目的: 検索クエリのローデータを毎日取り直してシートへ書き出す。除外KWの判断に使う。
-//   COST・CPC・CPA は CONFIG.FEE を掛けた値で出る。FEE を 1 以外にした場合、
+//   COST・CPC・CPA は案件マスタの fee係数を掛けた請求ベースで出る。
 //   下流の加工で再度 fee を掛けないこと。
 // 取得期間: 前月タブ＝前月1日〜前月末日／当月タブ＝当月1日〜実行日の前日。
 //   毎日どちらも取り直してタブを全面置換する。前月ぶんも取り直すのは、月が閉じた後も
@@ -19,9 +19,12 @@ const CONFIG = {
   TAB_PREV: "検索クエリ_前月_G",
   TAB_CUR: "検索クエリ_当月_G",
 
-  // fee係数。COST／CPC／CPA にこの係数を掛けて出力する。
-  // 1 のままなら管理画面ベース。請求ベースで出したい場合は案件の fee係数を入れる（例: 1.2）
-  FEE: 1,
+  // fee係数は案件マスタ（変更ログ収集システム_案件マスタ）の「fee係数」列から、
+  // 媒体とアカウントIDが一致する行を引いて使う。実行時に FEE へ入る。
+  MASTER_SHEET_ID: "1c0NKDkLUAqPRdBZIozR8LEzk2JzLRoU6t5T4VaFRfbE",
+  MASTER_TAB: "案件マスタ",
+  MEDIA: "Google広告",
+  FEE: null,
 
   // 検索広告のみに絞る。search_term_view はデマンドジェネレーションを含まないが、
   // ショッピング等の別タイプは入るため、CTR・CPCの水準を揃えるにはこのフィルタが要る。
@@ -43,6 +46,8 @@ function main() {
     throw new Error("CONFIG.SHEET_ID に書き出し先スプレッドシートのIDを入れてください");
   }
   Logger.log(`アカウント: ${AdsApp.currentAccount().getName()} (${AdsApp.currentAccount().getCustomerId()})`);
+  CONFIG.FEE = resolveFee(AdsApp.currentAccount().getCustomerId());
+  Logger.log(`fee係数: ${CONFIG.FEE}（案件マスタ）`);
   const ranges = resolveRanges();
 
   runOne(CONFIG.TAB_PREV, ranges.prev);
@@ -70,6 +75,86 @@ function runOne(tab, range) {
 
   writeSheet(tab, rows, range);
   Logger.log(`${tab}: ${rows.length}行を書き出しました`);
+}
+
+// ------------------------------------------------------------
+// 案件マスタ（fee係数）
+// ------------------------------------------------------------
+
+// fee を誤るとクライアント向けの数値がそのまま狂うため、1つに決められない場合は
+// 既定値で進めずに停止する。有効列は変更ログ収集用のため見ない。
+function resolveFee(accountId) {
+  const ss = SpreadsheetApp.openById(CONFIG.MASTER_SHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG.MASTER_TAB) || ss.getSheets()[0];
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) throw new Error(`案件マスタにデータ行がありません: ${CONFIG.MASTER_SHEET_ID}`);
+  const values = sheet.getRange(1, 1, lastRow, sheet.getLastColumn()).getValues();
+
+  // 見出しが1行目にあるとは限らないため、先頭数行から必須列が揃う行を探す。
+  let headerRow = -1;
+  let idx = null;
+  for (let h = 0; h < Math.min(values.length, 5) && headerRow < 0; h++) {
+    const cand = headerIndex(values[h], { media: ["媒体"], accountId: ["アカウントID"], fee: ["fee係数"] });
+    if (cand.media != null && cand.accountId != null && cand.fee != null) {
+      headerRow = h;
+      idx = cand;
+    }
+  }
+  if (headerRow < 0) throw new Error("案件マスタの見出し行が見つかりません（媒体／アカウントID／fee係数）");
+
+  const mine = [];
+  for (let i = headerRow + 1; i < values.length; i++) {
+    const row = values[i];
+    if (normalizeMedia(row[idx.media]) !== normalizeMedia(CONFIG.MEDIA)) continue;
+    if (normalizeId(row[idx.accountId]) !== normalizeId(accountId)) continue;
+    mine.push(row);
+  }
+  if (mine.length === 0) {
+    throw new Error(`案件マスタに行がありません（媒体=${CONFIG.MEDIA} アカウントID=${accountId}）。マスタに登録してから実行してください`);
+  }
+  if (mine.length > 1) {
+    throw new Error(`案件マスタに同一アカウントの行が${mine.length}件あります。どちらのfee係数を使うか決められないため停止します: ${accountId}`);
+  }
+
+  const fee = parseFee(mine[0][idx.fee]);
+  // 1未満や3以上は入力ミス（120 と 1.2 の取り違え等）とみなす。
+  if (!(fee >= 1 && fee < 3)) {
+    throw new Error(`案件マスタのfee係数が読めないか範囲外です: "${mine[0][idx.fee]}"（アカウントID=${accountId}）`);
+  }
+  return fee;
+}
+
+// セルが % 書式なら 1.2 の数値で返るが、文字列 "120.00%" で返ることもある。
+function parseFee(v) {
+  if (typeof v === "number") return v;
+  const s = String(v == null ? "" : v).trim();
+  const n = parseFloat(s.replace(/[^0-9.]/g, ""));
+  if (isNaN(n)) return NaN;
+  return /%$/.test(s) ? n / 100 : n;
+}
+
+// 見出し名から列位置を引く。列順の入れ替えや列の追加で壊れないようにする。
+function headerIndex(headerRow, spec) {
+  const norm = headerRow.map(h => String(h).replace(/\s/g, "").toLowerCase());
+  const out = {};
+  Object.keys(spec).forEach(key => {
+    out[key] = null;
+    for (let i = 0; i < spec[key].length && out[key] === null; i++) {
+      const at = norm.indexOf(spec[key][i].replace(/\s/g, "").toLowerCase());
+      if (at >= 0) out[key] = at;
+    }
+  });
+  return out;
+}
+
+// Google はハイフン入り（732-120-9001）、Yahoo は数値のまま入るため、記号を落として比較する。
+function normalizeId(v) {
+  return String(v == null ? "" : v).replace(/[^0-9a-zA-Z]/g, "");
+}
+
+// 媒体名は全角感嘆符・空白の揺れを吸収して比較する。
+function normalizeMedia(v) {
+  return String(v == null ? "" : v).replace(/\s/g, "").replace(/！/g, "!");
 }
 
 // ------------------------------------------------------------
@@ -248,8 +333,7 @@ function noteLine(range) {
   const period = range.empty
     ? `${range.label} 対象日なし（前日は前月末日のため前月タブを参照）`
     : `集計期間 ${range.start} 〜 ${range.end}（${range.label}）`;
-  return `${period}／fee係数 ${CONFIG.FEE}` +
-         `${CONFIG.FEE === 1 ? "（管理画面ベース）" : "（請求ベース）"}` +
+  return `${period}／fee係数 ${CONFIG.FEE}（案件マスタ・請求ベース）` +
          `${CONFIG.SEARCH_ONLY ? "／検索広告のみ" : "／全キャンペーンタイプ"}` +
          `／出力 ${Utilities.formatDate(new Date(), CONFIG.TIMEZONE, "yyyy-MM-dd HH:mm")}`;
 }
