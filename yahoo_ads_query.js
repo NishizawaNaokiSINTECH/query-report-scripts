@@ -8,7 +8,7 @@
 //   毎日どちらも取り直してタブを全面置換する。前月ぶんも取り直すのは、月が閉じた後も
 //   コンバージョンが遅れて計上され、確定まで数値が動くためである。
 // 実行環境: LINEヤフー広告スクリプト（対象の検索広告アカウントで作成する）
-// 出力先: CONFIG.SHEET_ID のスプレッドシートの CONFIG.TAB_PREV／CONFIG.TAB_CUR タブ（無ければ作成）
+// 出力先: 案件マスタの「出力先SHEET_ID」のブックの、TAB_PREV／TAB_CUR ＋タブ接尾辞 のタブ（無ければ作成）
 // スケジュール: 毎日 13:00〜14:00 を目安にする。Google版と同じブックへ書く場合は時間帯を分ける
 // 対象範囲: 検索広告（YSA）のみ。ディスプレイ広告（YDA）は AdsUtilities.getSearchReport の
 //   対象外のため本スクリプトでは取得しない。
@@ -20,17 +20,17 @@
 // ============================================================
 
 var CONFIG = {
-  // 書き出し先スプレッドシートのID（URLの /d/ と /edit の間の文字列）
-  SHEET_ID: "ここにスプレッドシートIDを入れる",
-  TAB_PREV: "検索クエリ_前月_Y",
-  TAB_CUR: "検索クエリ_当月_Y",
-
-  // fee係数は案件マスタ（変更ログ収集システム_案件マスタ）の「fee係数」列から、
-  // 媒体とアカウントIDが一致する行を引いて使う。実行時に FEE へ入る。
+  // 出力先・タブ接尾辞・fee係数は案件マスタ（変更ログ収集システム_案件マスタ）から、
+  // 媒体とアカウントIDが一致する行を引いて使う。SHEET_ID と FEE は実行時に入る。
   MASTER_SHEET_ID: "1c0NKDkLUAqPRdBZIozR8LEzk2JzLRoU6t5T4VaFRfbE",
   MASTER_TAB: "案件マスタ",
   MEDIA: "Yahoo!広告",
+  SHEET_ID: null,
   FEE: null,
+
+  // タブ名はこの後ろにマスタの「タブ接尾辞」（例: _ゴルフ）を付けたものになる。
+  TAB_PREV: "検索クエリ_前月_Y",
+  TAB_CUR: "検索クエリ_当月_Y",
 
   REPORT_TYPE: "SEARCH_QUERY",
 
@@ -53,16 +53,16 @@ var HEADER = [
 ];
 
 function main() {
-  if (!/^[A-Za-z0-9_-]{20,}$/.test(CONFIG.SHEET_ID)) {
-    throw new Error("CONFIG.SHEET_ID に書き出し先スプレッドシートのIDを入れてください");
-  }
-  Logger.log("アカウントID: " + AdsUtilities.getCurrentAccountId());
-  CONFIG.FEE = resolveFee(AdsUtilities.getCurrentAccountId());
-  Logger.log("fee係数: " + CONFIG.FEE + "（案件マスタ）");
+  var accountId = AdsUtilities.getCurrentAccountId();
+  Logger.log("アカウントID: " + accountId);
+  var setting = resolveSetting(accountId);
+  CONFIG.SHEET_ID = setting.sheetId;
+  CONFIG.FEE = setting.fee;
+  Logger.log("案件: " + setting.label + " / 出力先: " + setting.sheetId + " / fee係数: " + setting.fee);
   var ranges = resolveRanges();
 
-  runOne(CONFIG.TAB_PREV, ranges.prev);
-  runOne(CONFIG.TAB_CUR, ranges.cur);
+  runOne(CONFIG.TAB_PREV + setting.suffix, ranges.prev);
+  runOne(CONFIG.TAB_CUR + setting.suffix, ranges.cur);
 
   Logger.log("=== 完了 ===");
 }
@@ -89,12 +89,12 @@ function runOne(tab, range) {
 }
 
 // ------------------------------------------------------------
-// 案件マスタ（fee係数）
+// 案件マスタ（出力先・fee係数）
 // ------------------------------------------------------------
 
-// fee を誤るとクライアント向けの数値がそのまま狂うため、1つに決められない場合は
-// 既定値で進めずに停止する。有効列は変更ログ収集用のため見ない。
-function resolveFee(accountId) {
+// 出力先や fee を誤ると別案件のシートへ書いたり数値が狂ったりするため、
+// 1行に決められない場合は既定値で進めずに停止する。有効列は変更ログ収集用のため見ない。
+function resolveSetting(accountId) {
   var ss = SpreadsheetApp.openById(CONFIG.MASTER_SHEET_ID);
   var sheet = ss.getSheetByName(CONFIG.MASTER_TAB) || ss.getSheets()[0];
   var lastRow = sheet.getLastRow();
@@ -104,12 +104,15 @@ function resolveFee(accountId) {
   // 見出しが1行目にあるとは限らないため、先頭数行から必須列が揃う行を探す。
   var headerRow = -1, idx = null;
   for (var h = 0; h < Math.min(values.length, 5) && headerRow < 0; h++) {
-    var cand = headerIndex(values[h], { media: ["媒体"], accountId: ["アカウントID"], fee: ["fee係数"] });
-    if (cand.media != null && cand.accountId != null && cand.fee != null) {
+    var cand = headerIndex(values[h], {
+      project: ["案件"], area: ["領域"], media: ["媒体"], accountId: ["アカウントID"],
+      sheetId: ["出力先SHEET_ID", "出力先SHEETID", "出力先シートID"], suffix: ["タブ接尾辞"], fee: ["fee係数"]
+    });
+    if (cand.media != null && cand.accountId != null && cand.sheetId != null && cand.fee != null) {
       headerRow = h; idx = cand;
     }
   }
-  if (headerRow < 0) throw new Error("案件マスタの見出し行が見つかりません（媒体／アカウントID／fee係数）");
+  if (headerRow < 0) throw new Error("案件マスタの見出し行が見つかりません（媒体／アカウントID／出力先SHEET_ID／fee係数）");
 
   var mine = [];
   for (var i = headerRow + 1; i < values.length; i++) {
@@ -127,12 +130,22 @@ function resolveFee(accountId) {
                     "件あります。どちらのfee係数を使うか決められないため停止します: " + accountId);
   }
 
-  var fee = parseFee(mine[0][idx.fee]);
+  var r = mine[0];
+  var label = [idx.project != null ? String(r[idx.project]).trim() : "",
+               idx.area != null ? String(r[idx.area]).trim() : ""]
+    .filter(function (s) { return s; }).join(" ") || String(accountId);
+
+  var sheetId = String(r[idx.sheetId] == null ? "" : r[idx.sheetId]).trim();
+  if (!sheetId) throw new Error("案件マスタの出力先SHEET_ID が空です: " + label);
+
+  var fee = parseFee(r[idx.fee]);
   // 1未満や3以上は入力ミス（120 と 1.2 の取り違え等）とみなす。
   if (!(fee >= 1 && fee < 3)) {
-    throw new Error("案件マスタのfee係数が読めないか範囲外です: \"" + mine[0][idx.fee] + "\"（アカウントID=" + accountId + "）");
+    throw new Error("案件マスタのfee係数が読めないか範囲外です: \"" + r[idx.fee] + "\"（" + label + "）");
   }
-  return fee;
+
+  var suffix = idx.suffix != null ? String(r[idx.suffix] == null ? "" : r[idx.suffix]).trim() : "";
+  return { label: label, sheetId: sheetId, suffix: suffix, fee: fee };
 }
 
 // セルが % 書式なら 1.2 の数値で返るが、文字列 "120.00%" で返ることもある。
